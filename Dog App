@@ -1,0 +1,346 @@
+// Dog Treat Focus – Minimal React MVP
+// -----------------------------------
+// A tiny Flora-like focus app where each completed session earns "treats" (🦴).
+// Treats accumulate into a cash pledge to a dog shelter you choose.
+//
+// Features
+// - One-click focus timer (adjustable duration)
+// - Strict mode (leaving the tab fails the session)
+// - Rewards: earn treats per success (configurable); optional streak bonus
+// - Pledge math: pledge rate (cents per treat) -> shows pledged vs donated
+// - Pick a shelter (name + URL). "Donate now" opens the URL and logs a donation.
+// - Simple history and daily streak
+// - 100% client-side with localStorage
+//
+// How to use
+// - Drop this component into a React + Tailwind project and render <DogTreatFocusApp />
+// - Tailwind is assumed. If you don’t use it, replace the classNames or add minimal CSS.
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+const pad2 = (n) => String(n).padStart(2, "0");
+const fmt = (s) => `${pad2(Math.floor(s / 60))}:${pad2(s % 60)}`;
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const todayKey = () => new Date().toISOString().slice(0, 10);
+
+function load(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function save(key, v) {
+  try { localStorage.setItem(key, JSON.stringify(v)); } catch {}
+}
+
+export default function DogTreatFocusApp() {
+  // Settings
+  const [duration, setDuration] = useState(() => load("dtf_duration", 25 * 60));
+  const [strictMode, setStrictMode] = useState(() => load("dtf_strict", true));
+  const [treatsPerSuccess, setTreatsPerSuccess] = useState(() => load("dtf_treatsPerSuccess", 5));
+  const [streakBonus, setStreakBonus] = useState(() => load("dtf_streakBonus", 1)); // +1 treat per day of streak
+  const [streakBonusCap, setStreakBonusCap] = useState(() => load("dtf_streakCap", 5)); // max bonus
+  const [pledgeRateCents, setPledgeRateCents] = useState(() => load("dtf_pledgeRateCents", 2)); // $0.02 per treat by default
+  const [shelter, setShelter] = useState(() => load("dtf_shelter", { name: "Local Dog Shelter", url: "https://" }));
+
+  // Runtime
+  const [remaining, setRemaining] = useState(duration);
+  const [running, setRunning] = useState(false);
+  const [status, setStatus] = useState("idle"); // idle | running | paused | done | failed
+  const [message, setMessage] = useState("");
+
+  // Rewards & history
+  const [treats, setTreats] = useState(() => load("dtf_treats", 0));
+  const [donatedCents, setDonatedCents] = useState(() => load("dtf_donatedCents", 0));
+  const [history, setHistory] = useState(() => load("dtf_history", [])); // [{at, duration, success, earnedTreats, note}]
+
+  const tickRef = useRef(null);
+  const startedAtRef = useRef(null);
+
+  // Persist
+  useEffect(() => save("dtf_duration", duration), [duration]);
+  useEffect(() => save("dtf_strict", strictMode), [strictMode]);
+  useEffect(() => save("dtf_treatsPerSuccess", treatsPerSuccess), [treatsPerSuccess]);
+  useEffect(() => save("dtf_streakBonus", streakBonus), [streakBonus]);
+  useEffect(() => save("dtf_streakCap", streakBonusCap), [streakBonusCap]);
+  useEffect(() => save("dtf_pledgeRateCents", pledgeRateCents), [pledgeRateCents]);
+  useEffect(() => save("dtf_shelter", shelter), [shelter]);
+  useEffect(() => save("dtf_treats", treats), [treats]);
+  useEffect(() => save("dtf_donatedCents", donatedCents), [donatedCents]);
+  useEffect(() => save("dtf_history", history), [history]);
+
+  // Sync remaining when duration changes (only idle)
+  useEffect(() => { if (status === "idle") setRemaining(duration); }, [duration, status]);
+
+  // Strict mode: tab leave fails
+  useEffect(() => {
+    const onVis = () => { if (document.hidden && running && strictMode) fail("Left the tab — session failed."); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [running, strictMode]);
+
+  // Timer
+  useEffect(() => {
+    if (!running) return;
+    tickRef.current = setInterval(() => {
+      setRemaining((r) => {
+        if (r <= 1) {
+          clearInterval(tickRef.current);
+          complete();
+          return 0;
+        }
+        return r - 1;
+      });
+    }, 1000);
+    return () => clearInterval(tickRef.current);
+  }, [running]);
+
+  const successDays = useMemo(() => new Set(history.filter(h => h.success).map(h => h.at.slice(0, 10))), [history]);
+  const streak = useMemo(() => {
+    let n = 0; let d = new Date();
+    for (;;) {
+      const key = d.toISOString().slice(0,10);
+      if (successDays.has(key)) { n++; d.setDate(d.getDate()-1); } else break;
+    }
+    return n;
+  }, [successDays]);
+
+  const pledgedCents = treats * pledgeRateCents;
+  const outstandingCents = Math.max(0, pledgedCents - donatedCents);
+
+  // Actions
+  function start() {
+    setStatus("running");
+    setRunning(true);
+    setMessage("");
+    startedAtRef.current = Date.now();
+  }
+  function pause() {
+    setRunning(false);
+    setStatus("paused");
+  }
+  function resume() {
+    setRunning(true);
+    setStatus("running");
+  }
+  function reset() {
+    setRunning(false);
+    setStatus("idle");
+    setMessage("");
+    setRemaining(duration);
+  }
+  function complete() {
+    setRunning(false);
+    setStatus("done");
+    const bonus = clamp(streakBonus * Math.min(streak + 1, streakBonusCap), 0, 999);
+    const earned = treatsPerSuccess + bonus;
+    setTreats((t) => t + earned);
+    setHistory((h) => [{ at: new Date().toISOString(), duration, success: true, earnedTreats: earned }, ...h]);
+    setMessage(`Nice! +${earned} 🦴 (includes ${bonus} streak bonus)`);
+  }
+  function fail(note = "") {
+    setRunning(false);
+    setStatus("failed");
+    setHistory((h) => [{ at: new Date().toISOString(), duration: duration - remaining, success: false, earnedTreats: 0, note }, ...h]);
+    setMessage(note || "Session failed.");
+  }
+
+  function donateNow() {
+    if (!shelter?.url || shelter.url === "https://") {
+      alert("Add a valid shelter URL in Settings first.");
+      return;
+    }
+    if (outstandingCents <= 0) {
+      alert("No outstanding pledge right now. Finish a session to earn more treats!");
+      return;
+    }
+    // Open shelter site so the user can donate, then mark as donated.
+    window.open(shelter.url, "_blank");
+    if (confirm(`Mark $${(outstandingCents/100).toFixed(2)} as donated to ${shelter.name}?`)) {
+      setDonatedCents((c) => c + outstandingCents);
+      setMessage(`Marked $${(outstandingCents/100).toFixed(2)} as donated. Thank you! 🐶❤️`);
+    }
+  }
+
+  // UI helpers
+  const canStart = status === "idle" || status === "paused" || status === "done" || status === "failed";
+  const progress = 1 - remaining / duration;
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-emerald-50 to-white text-slate-800">
+      <div className="max-w-4xl mx-auto p-6">
+        <header className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold">Dog Treat Focus <span className="ml-2">🐶🦴</span></h1>
+          <Settings
+            shelter={shelter} setShelter={setShelter}
+            duration={duration} setDuration={setDuration}
+            strictMode={strictMode} setStrictMode={setStrictMode}
+            treatsPerSuccess={treatsPerSuccess} setTreatsPerSuccess={setTreatsPerSuccess}
+            streakBonus={streakBonus} setStreakBonus={setStreakBonus}
+            streakBonusCap={streakBonusCap} setStreakBonusCap={setStreakBonusCap}
+            pledgeRateCents={pledgeRateCents} setPledgeRateCents={setPledgeRateCents}
+          />
+        </header>
+
+        <main className="grid md:grid-cols-2 gap-6 mt-6">
+          {/* Focus Card */}
+          <div className="p-5 rounded-2xl bg-white border shadow-sm">
+            <div className="text-sm text-slate-500">Stay focused to earn treats for shelter donations</div>
+
+            <div className="flex flex-col items-center mt-4">
+              <TimerCircle progress={progress} />
+              <div className="mt-4 text-4xl font-mono tabular-nums">{fmt(remaining)}</div>
+              <div className="mt-1 text-xs text-slate-500">{Math.round(duration/60)} min session</div>
+
+              <div className="flex gap-2 mt-4">
+                {running ? (
+                  <button onClick={pause} className="px-4 py-2 rounded-xl bg-amber-100 hover:bg-amber-200">Pause</button>
+                ) : (
+                  <button onClick={canStart ? start : resume} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white">{canStart ? "Plant & Focus" : "Resume"}</button>
+                )}
+                <button onClick={reset} className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200">Reset</button>
+                {status === "running" && (
+                  <button onClick={() => fail("Manual stop")} className="px-4 py-2 rounded-xl bg-rose-100 hover:bg-rose-200">Give Up</button>
+                )}
+              </div>
+
+              {message && <div className="mt-3 text-sm text-slate-700">{message}</div>}
+
+              <div className="mt-4 text-3xl">{status === "failed" ? "💀" : status === "done" ? "🌳" : progress > 0.66 ? "🌲" : progress > 0.33 ? "🌿" : "🌱"}</div>
+            </div>
+          </div>
+
+          {/* Rewards / Pledge */}
+          <div className="p-5 rounded-2xl bg-white border shadow-sm">
+            <div className="flex items-center justify-between">
+              <h2 className="font-semibold">Rewards & Pledge</h2>
+              <div className="text-xs text-slate-500">Streak: <b>{streak}</b> days</div>
+            </div>
+
+            <div className="mt-3 grid grid-cols-3 gap-3">
+              <Stat label="Treats" value={`${treats} 🦴`} />
+              <Stat label="Pledged" value={`$${(pledgedCents/100).toFixed(2)}`} />
+              <Stat label="Donated" value={`$${(donatedCents/100).toFixed(2)}`} />
+            </div>
+
+            <div className="mt-4 p-3 rounded-xl bg-emerald-50 border border-emerald-100">
+              <div className="text-sm">
+                Outstanding pledge: <b>${(outstandingCents/100).toFixed(2)}</b> to <b>{shelter.name || "[add in Settings]"}</b>
+              </div>
+              <div className="text-xs text-slate-600 mt-1">Rate: ${ (pledgeRateCents/100).toFixed(2) } per treat • Next session earns ~{treatsPerSuccess + Math.min(streak+1, streakBonusCap)*streakBonus} treats</div>
+              <div className="mt-3 flex gap-2">
+                <button onClick={donateNow} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white">Donate Now</button>
+                <button onClick={() => { setTreats(0); setDonatedCents(0); }} className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200">Reset Totals</button>
+              </div>
+            </div>
+          </div>
+
+          {/* History */}
+          <div className="md:col-span-2 p-5 rounded-2xl bg-white border shadow-sm">
+            <h2 className="font-semibold">History</h2>
+            {history.length === 0 ? (
+              <div className="text-sm text-slate-500 mt-2">No sessions yet. Finish your first one to earn treats!</div>
+            ) : (
+              <div className="mt-3 grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {history.map((h, i) => (
+                  <div key={i} className={`p-3 rounded-xl border ${h.success ? "bg-emerald-50 border-emerald-100" : "bg-rose-50 border-rose-100"}`}>
+                    <div className="text-sm">{new Date(h.at).toLocaleString()}</div>
+                    <div className="text-xs text-slate-600">{h.success ? "Success" : "Failed"} • {Math.round((h.duration || 0)/60)} min</div>
+                    {h.success && <div className="mt-1 text-sm">+{h.earnedTreats} 🦴</div>}
+                    {h.note && <div className="text-xs text-slate-500 mt-1">{h.note}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </main>
+
+        <footer className="mt-8 text-xs text-slate-400 text-center">
+          Built with ❤️ for pups. Finish sessions → earn treats → fund shelters.
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="p-3 rounded-xl bg-slate-50 text-center border">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className="text-lg font-semibold">{value}</div>
+    </div>
+  );
+}
+
+function TimerCircle({ progress }) {
+  const radius = 60; const c = 2*Math.PI*radius; const off = c * (1 - (isFinite(progress) ? progress : 0));
+  return (
+    <svg viewBox="0 0 160 160" className="w-40 h-40">
+      <circle cx="80" cy="80" r={radius} strokeWidth="14" fill="none" className="stroke-slate-200" />
+      <circle cx="80" cy="80" r={radius} strokeWidth="14" fill="none" className="stroke-emerald-500" strokeDasharray={c} strokeDashoffset={off} strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function Settings({ shelter, setShelter, duration, setDuration, strictMode, setStrictMode, treatsPerSuccess, setTreatsPerSuccess, streakBonus, setStreakBonus, streakBonusCap, setStreakBonusCap, pledgeRateCents, setPledgeRateCents }) {
+  return (
+    <details className="group">
+      <summary className="cursor-pointer text-sm text-slate-600 hover:text-slate-800 select-none">Settings ⚙️</summary>
+      <div className="mt-3 p-4 rounded-2xl bg-white border shadow-sm grid sm:grid-cols-2 gap-4">
+        <L label="Session length (min)">
+          <Number value={Math.round(duration/60)} onChange={(v) => setDuration(clamp(v,1,180)*60)} min={1} max={180} />
+        </L>
+        <L label="Strict mode (tab away = fail)">
+          <Checkbox checked={strictMode} onChange={setStrictMode} />
+        </L>
+        <L label="Treats per success (base)">
+          <Number value={treatsPerSuccess} onChange={(v) => setTreatsPerSuccess(clamp(v,1,100))} min={1} max={100} />
+        </L>
+        <L label="Streak bonus per day">
+          <Number value={streakBonus} onChange={(v) => setStreakBonus(clamp(v,0,10))} min={0} max={10} />
+        </L>
+        <L label="Streak bonus cap (days)">
+          <Number value={streakBonusCap} onChange={(v) => setStreakBonusCap(clamp(v,0,30))} min={0} max={30} />
+        </L>
+        <L label="Pledge rate (cents per treat)">
+          <Number value={pledgeRateCents} onChange={(v) => setPledgeRateCents(clamp(v,1,1000))} min={1} max={1000} />
+        </L>
+        <L label="Shelter name">
+          <input className="w-full px-3 py-2 rounded-xl border" value={shelter?.name||""} onChange={(e)=>setShelter({ ...shelter, name: e.target.value })} placeholder="Local Dog Rescue" />
+        </L>
+        <L label="Shelter URL">
+          <input className="w-full px-3 py-2 rounded-xl border" value={shelter?.url||""} onChange={(e)=>setShelter({ ...shelter, url: e.target.value })} placeholder="https://…" />
+        </L>
+      </div>
+    </details>
+  );
+}
+
+function L({ label, children }) {
+  return (
+    <label className="text-sm grid gap-2">
+      <span className="text-slate-600">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function Number({ value, onChange, min=0, max=999 }) {
+  return (
+    <div className="flex items-center gap-2">
+      <button onClick={()=>onChange(clamp((value||0)-1, min, max))} className="px-2 py-1 rounded-lg bg-slate-100">−</button>
+      <input type="number" value={value} onChange={(e)=>onChange(clamp(parseInt(e.target.value||"0",10), min, max))} className="w-20 px-3 py-2 rounded-lg border text-center" />
+      <button onClick={()=>onChange(clamp((value||0)+1, min, max))} className="px-2 py-1 rounded-lg bg-slate-100">+</button>
+    </div>
+  );
+}
+
+function Checkbox({ checked, onChange }) {
+  return (
+    <button onClick={()=>onChange(!checked)} className={`w-10 h-10 rounded-xl border flex items-center justify-center ${checked?"bg-emerald-100 border-emerald-300":"bg-white"}`}>
+      {checked ? "✅" : "⬜"}
+    </button>
+  );
+}
